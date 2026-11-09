@@ -16,6 +16,9 @@ on:
       nxnative_ref:
         description: nxnative commit
         default: d8b2b64a1fc52035f44cfa487637ba0d6f7fe69c
+      known_lib_sha256:
+        description: sha256 of the shader library image already on the device (skip sending it when equal)
+        default: 4e3c09ea83ab6d0f7c411b9a95847a61305c2bf6957a298c28388598de3e5541
 
 permissions:
   contents: read
@@ -155,6 +158,7 @@ jobs:
         if: always()
         env:
           GAME_KEY: ${{ secrets.GAME_KEY }}
+          KNOWN_LIB: ${{ inputs.known_lib_sha256 }}
         run: |
           set -euo pipefail
           read -r key _ <<< "$GAME_KEY"
@@ -166,9 +170,35 @@ jobs:
           iv=$(openssl rand -hex 16); echo "$iv" > "$GITHUB_WORKSPACE/enc/logs.iv"
           openssl enc -aes-256-ctr -K "$key" -iv "$iv" -in "$WORK/logs.tgz" -out "$GITHUB_WORKSPACE/enc/logs.tgz.enc"
           if [ -s "$WORK/out/app.ipa" ]; then
-            iv=$(openssl rand -hex 16); echo "$iv" > "$GITHUB_WORKSPACE/enc/app.iv"
-            openssl enc -aes-256-ctr -K "$key" -iv "$iv" -in "$WORK/out/app.ipa" -out "$GITHUB_WORKSPACE/enc/app.ipa.enc"
+            # The shader library image (over 4 GiB) goes to the device's Documents, not into the app:
+            # take it out here, so the app is small, and send the image only when it changed.
+            python3 - "$WORK/out/app.ipa" "$WORK/out/app-slim.ipa" "$WORK/out/lib" <<'PY'
+          import shutil, sys, zipfile
+          from pathlib import Path
+          src, dst, lib = sys.argv[1], sys.argv[2], Path(sys.argv[3]); lib.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, 'w', allowZip64=True) as zo:
+              for info in zi.infolist():
+                  parts = info.filename.split('/')
+                  if len(parts) == 4 and parts[0] == 'Payload' and parts[2] == 'msl' and parts[3].endswith('.img'):
+                      with zi.open(info) as r, open(lib / parts[3], 'wb') as w: shutil.copyfileobj(r, w, 1 << 24)
+                      continue
+                  with zi.open(info) as r, zo.open(info, 'w', force_zip64=info.file_size >= 1 << 32) as w: shutil.copyfileobj(r, w, 1 << 24)
+          PY
             rm "$WORK/out/app.ipa"
+            iv=$(openssl rand -hex 16); echo "$iv" > "$GITHUB_WORKSPACE/enc/app.iv"
+            openssl enc -aes-256-ctr -K "$key" -iv "$iv" -in "$WORK/out/app-slim.ipa" -out "$GITHUB_WORKSPACE/enc/app.ipa.enc"
+            for img in "$WORK"/out/lib/*.img; do
+              [ -e "$img" ] || continue
+              sum=$(shasum -a 256 "$img" | cut -d' ' -f1)
+              echo "shader library image: $(basename "$img") sha256 $sum" | tee -a "$GITHUB_WORKSPACE/enc/lib.txt"
+              if [ "$sum" != "$KNOWN_LIB" ]; then
+                echo "changed: sending it in pieces"
+                iv=$(openssl rand -hex 16); echo "$iv" > "$GITHUB_WORKSPACE/enc/lib.iv"
+                openssl enc -aes-256-ctr -K "$key" -iv "$iv" -in "$img" | split -b 1900m - "$GITHUB_WORKSPACE/enc/lib.enc.part-"
+              else
+                echo "unchanged: the device's copy stays"
+              fi
+            done
           fi
           ls -la "$GITHUB_WORKSPACE/enc" | awk '{print $5, $9}'
 
