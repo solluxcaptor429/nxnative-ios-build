@@ -1,0 +1,77 @@
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 517e593..65adbee 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -124,7 +124,7 @@ private struct LauncherView: View {
+                         }
+                     }
+                     Section {
+-                        Button("Reset to tested defaults") { m.reset() }
++                        Button("Reset to recommended") { m.reset() }
+                             .disabled(!m.changed)
+                     } footer: {
+                         Text("Brings back all settings this game was tested with.")
+diff --git a/dm/ios/Sources/LauncherSettings.swift b/dm/ios/Sources/LauncherSettings.swift
+index aec4414..c4811f5 100644
+--- a/dm/ios/Sources/LauncherSettings.swift
++++ b/dm/ios/Sources/LauncherSettings.swift
+@@ -3,7 +3,24 @@ import Foundation
+ import Combine
+ 
+ struct Setting: Decodable, Identifiable {
+-    let env, kind, label, note, def: String
++    let env, kind, label, note: String
++    let baseDef: String    // "default"
++    let devices: [String: String]?   // per-device defaults: the first of Setting.deviceKeys found here wins over "default"
++    var def: String { devices.flatMap { d in Setting.deviceKeys.lazy.compactMap { d[$0] }.first } ?? baseDef }
++    // This device's keys, most specific first: its model ("iPhone18,2", "iPad16,6"), its class with its memory ("iphone-12gb",
++    // "ipad-16gb", "ipad-8gb"), its class ("iphone", "ipad") and "ios"; a Mac has its model and "mac". The values tested on a
++    // device become its defaults, which "Reset to recommended" brings back; every setting stays changeable on the screen
++    static let deviceKeys: [String] = {
++        var u = utsname(); uname(&u)
++        let model = withUnsafeBytes(of: &u.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
++        let gb = Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824).rounded())
++        let keys: [String]
++        if model.hasPrefix("iPhone") { keys = [model, gb >= 12 ? "iphone-12gb" : "iphone-small", "iphone", "ios"] }
++        else if model.hasPrefix("iPad") { keys = [model, gb >= 16 ? "ipad-16gb" : gb >= 8 ? "ipad-8gb" : "ipad-small", "ipad", "ios"] }
++        else { keys = [model, "mac"] }
++        fputs("launcher: device \(model), \(gb) GB: default keys \(keys.joined(separator: " "))\n", stderr)
++        return keys
++    }()
+     let section: String?   // heading on the settings screen; absent in older bundles
+     let needs: String?     // "<VAR>=<value>": a sub-setting, drawn only while that setting has that value
+     let level: String?     // "basic": shown first (the Mac window's Basic settings); any other or none: Advanced settings. The iPhone keeps one list
+@@ -30,7 +47,7 @@ struct Setting: Decodable, Identifiable {
+         default: return true
+         }
+     }
+-    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, needs, level, base, options, min, max, step, on, off }
++    enum CodingKeys: String, CodingKey { case env, kind, label, note, baseDef = "default", devices, section, needs, level, base, options, min, max, step, on, off }
+ }
+ struct SettingsFile: Decodable { let settings: [Setting] }
+ 
+@@ -120,6 +137,7 @@ final class LauncherModel: ObservableObject {
+         for s in settings where !fixed.contains(s.env) {
+             let v = values[s.env] ?? s.def
+             if !s.isDefault(v) { setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v) (saved choice)\n", stderr) }
++            else if s.devices != nil { setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v) (device default)\n", stderr) }   // the host's own default is the profile's
+         }
+     }
+ }
+diff --git a/dm/ios/Sources/main.m b/dm/ios/Sources/main.m
+index 7cd198e..05ebdb6 100644
+--- a/dm/ios/Sources/main.m
++++ b/dm/ios/Sources/main.m
+@@ -220,6 +220,12 @@ static NSString *program_env(void) {
+     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
+     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
+     setenv("DM_NVN_SHMAP", [dmdir stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
++    // The shader libraries in Documents/msl when the app has none (an app signed where files over 4 GiB cannot be hashed carries
++    // its library image beside the game files instead): found by itself, so no env.txt has to name the container's path
++    BOOL bundled = NO;
++    for (NSString *f in [fm contentsOfDirectoryAtPath:msl error:nil]) if ([f hasPrefix:@"b-"]) { bundled = YES; break; }
++    NSString *docmsl = [doc stringByAppendingPathComponent:@"msl"]; if (prog) docmsl = [docmsl stringByAppendingPathComponent:prog];
++    if (!bundled && [fm fileExistsAtPath:docmsl]) { msl = docmsl; fprintf(stderr, "boot: shader libraries from Documents (%s)\n", msl.fileSystemRepresentation); }
+     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
+     return dmdir;
+ }

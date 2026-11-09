@@ -64,6 +64,15 @@ jobs:
           ref: ${{ inputs.nxnative_ref }}
           persist-credentials: false
 
+      - name: Apply patches
+        run: |
+          # patches/*.patch of this repository at this run's commit (public, so no token): small generic changes to nxnative's iOS app
+          for p in $(curl -fsSL "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/patches?ref=${GITHUB_SHA}" | python3 -c "import json,sys; print(' '.join(sorted(f['name'] for f in json.load(sys.stdin) if f['name'].endswith('.patch'))))"); do
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/patches/$p" -o "/tmp/$p"
+            git apply --whitespace=nowarn "/tmp/$p" || { echo "patch $p does not apply"; exit 1; }
+            echo "applied $p"
+          done
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
