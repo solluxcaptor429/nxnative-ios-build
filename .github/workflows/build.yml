@@ -82,9 +82,23 @@ jobs:
           } > "$LOGS/2-toolchain.txt" 2>&1 || { echo "failed (details in the encrypted logs)"; exit 1; }
           echo "ok"
 
+      - name: Check access
+        env:
+          SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+        run: |
+          tok=$(printf %s "$SRC_TOKEN" | tr -d '[:space:]')
+          [ -n "$tok" ] || { echo "SRC_TOKEN is empty"; exit 1; }
+          echo "token: ${#tok} characters, prefix ${tok:0:11}"
+          code() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H "Accept: application/vnd.github+json" "https://api.github.com/$1"; }
+          echo "token valid (GET /user): $(code user)"
+          echo "repository readable: $(code "repos/$SRC_REPO")"
+          echo "releases readable: $(code "repos/$SRC_REPO/releases/tags/game-v1")"
+          [ "$(code "repos/$SRC_REPO/releases/tags/game-v1")" = 200 ] || { echo "the token cannot read the input release (401: bad token; 404: token not given this repository or Contents permission)"; exit 1; }
+          echo "GH_TOKEN=$tok" >> "$GITHUB_ENV"
+
       - name: Fetch input
         env:
-          GH_TOKEN: ${{ secrets.SRC_TOKEN }}
           SRC_REPO: ${{ secrets.SRC_REPO }}
           GAME_KEY: ${{ secrets.GAME_KEY }}
         run: |
@@ -162,15 +176,18 @@ jobs:
       - name: Upload
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.SRC_TOKEN }}
+          SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
           SRC_REPO: ${{ secrets.SRC_REPO }}
         run: |
+          export GH_TOKEN=$(printf %s "$SRC_TOKEN" | tr -d '[:space:]')
           tag="build-${GITHUB_RUN_ID}"
-          gh release create "$tag" -R "$SRC_REPO" --title "$tag" --notes "encrypted outputs of run $GITHUB_RUN_ID" > /dev/null 2>&1 || true
+          gh release create "$tag" -R "$SRC_REPO" --title "$tag" --notes "encrypted outputs of run $GITHUB_RUN_ID" > /dev/null 2>&1 || echo "release not created (write access?)"
+          ok=0
           for f in enc/*; do
             for attempt in 1 2 3 4 5; do
-              gh release upload "$tag" "$f" -R "$SRC_REPO" --clobber > /dev/null 2>&1 && break
+              if gh release upload "$tag" "$f" -R "$SRC_REPO" --clobber > /dev/null 2>&1; then ok=$((ok + 1)); break; fi
               sleep $((attempt * 20))
             done
           done
-          echo "uploaded $(ls enc | wc -l | tr -d ' ') files"
+          echo "uploaded $ok of $(ls enc | wc -l | tr -d ' ') files"
+          [ "$ok" -gt 0 ]
