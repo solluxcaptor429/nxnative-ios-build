@@ -1,0 +1,176 @@
+name: build
+
+# Builds an unsigned iOS app with nxnative (https://github.com/seedds/nxnative) from the owner's own
+# game dump. Nothing about the game is in this repository:
+#   * the input is AES-256-CTR encrypted pieces in a private repository's release (SRC_REPO, SRC_TOKEN:
+#     read-only), decrypted only inside the runner;
+#   * the app name and build options come from secrets;
+#   * every tool's output goes to log files that are encrypted before upload, so the public run log
+#     only shows which steps passed;
+#   * the app is encrypted before upload.
+# Secrets: GAME_KEY ("<key hex> <iv hex>"), SRC_REPO (owner/name), SRC_TOKEN, APP_NAME, BUILD_ARGS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      nxnative_ref:
+        description: nxnative commit
+        default: d8b2b64a1fc52035f44cfa487637ba0d6f7fe69c
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  WORK: ${{ github.workspace }}/../work
+  LOGS: ${{ github.workspace }}/../logs
+
+jobs:
+  build:
+    # only the owner can start it (workflow_dispatch needs write access; this also covers forks)
+    if: github.repository_owner == 'solluxcaptor429' && github.actor == 'solluxcaptor429'
+    runs-on: xcode-27
+    timeout-minutes: 360
+    steps:
+      - name: Prepare
+        run: |
+          mkdir -p "$WORK" "$LOGS"
+          {
+            df -h /System/Volumes/Data
+            for x in /Applications/Xcode_27.0*.app /Applications/Xcode_27.1*.app; do
+              [ -e "$x" ] && sudo rm -rf "$x" && echo "removed $x"
+            done
+            xcrun simctl shutdown all || true
+            xcrun simctl runtime delete all || true
+            sudo rm -rf ~/Library/Developer/CoreSimulator /Library/Developer/CoreSimulator/Volumes || true
+            sudo rm -rf /Users/runner/hostedtoolcache/CodeQL /Users/runner/hostedtoolcache/go /Users/runner/hostedtoolcache/Java_* ~/Library/Android || true
+            df -h /System/Volumes/Data
+          } > "$LOGS/1-prepare.txt" 2>&1
+          echo "ok"
+
+      - name: Check out nxnative
+        uses: actions/checkout@v5
+        with:
+          repository: seedds/nxnative
+          ref: ${{ inputs.nxnative_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Toolchain
+        run: |
+          {
+            xcodebuild -version
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun --sdk iphoneos --show-sdk-version || xcodebuild -downloadPlatform iOS
+            xcrun --sdk iphoneos --show-sdk-version
+            xcrun -sdk iphoneos metal --version
+            brew install xcodegen zstd glslang
+            python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic
+          } > "$LOGS/2-toolchain.txt" 2>&1 || { echo "failed (details in the encrypted logs)"; exit 1; }
+          echo "ok"
+
+      - name: Fetch input
+        env:
+          GH_TOKEN: ${{ secrets.SRC_TOKEN }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+          GAME_KEY: ${{ secrets.GAME_KEY }}
+        run: |
+          set -euo pipefail
+          read -r key iv <<< "$GAME_KEY"
+          echo "::add-mask::$key"
+          echo "::add-mask::$iv"
+          cd "$WORK"
+          L="$LOGS/3-fetch.txt"
+          gh release download game-v1 -R "$SRC_REPO" -p manifest.json -O manifest.json >> "$L" 2>&1
+          want=$(python -c "import json; print(json.load(open('manifest.json'))['sha256'])")
+          pieces=$(python -c "import json; print(' '.join(p['name'] for p in json.load(open('manifest.json'))['pieces']))")
+          mkdir -p pieces
+          fetch() {
+            local p=$1 sum
+            sum=$(python -c "import json,sys; print(next(x['sha256'] for x in json.load(open('manifest.json'))['pieces'] if x['name']==sys.argv[1]))" "$p")
+            for attempt in 1 2 3 4 5 6; do
+              rm -f "pieces/$p"
+              if gh release download game-v1 -R "$SRC_REPO" -p "$p" -D pieces --clobber >> "$L" 2>&1 \
+                 && [ "$(shasum -a 256 "pieces/$p" | cut -d' ' -f1)" = "$sum" ]; then
+                echo "piece ok (attempt $attempt)" >&2; return 0
+              fi
+              echo "piece retry $attempt" >&2
+              sleep $((attempt * 15))
+            done
+            echo "piece failed" >&2; return 1
+          }
+          { for p in $pieces; do fetch "$p"; cat "pieces/$p"; rm "pieces/$p"; done; } \
+            | openssl enc -d -aes-256-ctr -K "$key" -iv "$iv" \
+            | tee input.bin | shasum -a 256 | cut -d' ' -f1 > got.sha
+          rm -f manifest.json
+          [ "$(cat got.sha)" = "$want" ] || { echo "checksum mismatch"; exit 1; }
+          mv input.bin input.nup
+          echo "ok, checksum matches"
+
+      - name: Build
+        env:
+          APP_NAME: ${{ secrets.APP_NAME }}
+          BUILD_ARGS: ${{ secrets.BUILD_ARGS }}
+        run: |
+          mkdir -p "$WORK/out"
+          start=$(date +%s)
+          python scripts/build_ipa_from_nsp.py "$WORK/input.nup" --romfs separate --keep-extracted \
+            --progress lines --app-name "$APP_NAME" -o "$WORK/out/app.ipa" $BUILD_ARGS \
+            > "$LOGS/4-build.txt" 2>&1 &
+          pid=$!
+          # a heartbeat without content, so a long shader stage still shows life
+          while kill -0 $pid 2>/dev/null; do sleep 300; kill -0 $pid 2>/dev/null && echo "running, $(( ($(date +%s) - start) / 60 )) min"; done
+          wait $pid && [ -s "$WORK/out/app.ipa" ] || { echo "failed (details in the encrypted logs)"; exit 1; }
+          echo "ok, $(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Encrypt outputs
+        if: always()
+        env:
+          GAME_KEY: ${{ secrets.GAME_KEY }}
+        run: |
+          set -euo pipefail
+          read -r key _ <<< "$GAME_KEY"
+          echo "::add-mask::$key"
+          mkdir -p "$GITHUB_WORKSPACE/enc"
+          for d in "$WORK"/*_build/logs; do [ -d "$d" ] && cp -R "$d" "$LOGS/build-logs"; done
+          df -h /System/Volumes/Data > "$LOGS/disk.txt" 2>&1 || true
+          tar -czf "$WORK/logs.tgz" -C "$LOGS" .
+          iv=$(openssl rand -hex 16); echo "$iv" > "$GITHUB_WORKSPACE/enc/logs.iv"
+          openssl enc -aes-256-ctr -K "$key" -iv "$iv" -in "$WORK/logs.tgz" -out "$GITHUB_WORKSPACE/enc/logs.tgz.enc"
+          if [ -s "$WORK/out/app.ipa" ]; then
+            iv=$(openssl rand -hex 16); echo "$iv" > "$GITHUB_WORKSPACE/enc/app.iv"
+            openssl enc -aes-256-ctr -K "$key" -iv "$iv" -in "$WORK/out/app.ipa" -out "$GITHUB_WORKSPACE/enc/app.ipa.enc"
+            rm "$WORK/out/app.ipa"
+          fi
+          ls -la "$GITHUB_WORKSPACE/enc" | awk '{print $5, $9}'
+
+      # to the private repository (never an artifact here: a public repository's artifacts can be
+      # downloaded by any signed-in user, encrypted or not)
+      - name: Upload
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_TOKEN }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+        run: |
+          tag="build-${GITHUB_RUN_ID}"
+          gh release create "$tag" -R "$SRC_REPO" --title "$tag" --notes "encrypted outputs of run $GITHUB_RUN_ID" > /dev/null 2>&1 || true
+          for f in enc/*; do
+            for attempt in 1 2 3 4 5; do
+              gh release upload "$tag" "$f" -R "$SRC_REPO" --clobber > /dev/null 2>&1 && break
+              sleep $((attempt * 20))
+            done
+          done
+          echo "uploaded $(ls enc | wc -l | tr -d ' ') files"
