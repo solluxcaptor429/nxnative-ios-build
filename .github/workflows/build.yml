@@ -89,7 +89,8 @@ jobs:
         run: |
           tok=$(printf %s "$SRC_TOKEN" | tr -d '[:space:]')
           [ -n "$tok" ] || { echo "SRC_TOKEN is empty"; exit 1; }
-          echo "token: ${#tok} characters, prefix ${tok:0:11}"
+          echo "::add-mask::$tok"
+          echo "token: ${#tok} characters, whitespace removed: $(( ${#SRC_TOKEN} - ${#tok} ))"
           code() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H "Accept: application/vnd.github+json" "https://api.github.com/$1"; }
           echo "token valid (GET /user): $(code user)"
           echo "repository readable: $(code "repos/$SRC_REPO")"
@@ -179,7 +180,9 @@ jobs:
           SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
           SRC_REPO: ${{ secrets.SRC_REPO }}
         run: |
-          export GH_TOKEN=$(printf %s "$SRC_TOKEN" | tr -d '[:space:]')
+          tok=$(printf %s "$SRC_TOKEN" | tr -d '[:space:]')
+          echo "::add-mask::$tok"
+          export GH_TOKEN="$tok"
           tag="build-${GITHUB_RUN_ID}"
           gh release create "$tag" -R "$SRC_REPO" --title "$tag" --notes "encrypted outputs of run $GITHUB_RUN_ID" > /dev/null 2>&1 || echo "release not created (write access?)"
           ok=0
