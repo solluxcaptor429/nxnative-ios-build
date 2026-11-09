@@ -1,0 +1,32 @@
+name: check access
+
+# Reports only HTTP status codes for the source token: whether it is valid, whether it sees the
+# source repository, and whether it can read and write its releases. Prints no content.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.repository_owner == 'solluxcaptor429' && github.actor == 'solluxcaptor429'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check access
+        env:
+          SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+        run: |
+          tok=$(printf %s "$SRC_TOKEN" | tr -d '[:space:]')
+          echo "::add-mask::$tok"
+          echo "token: ${#tok} characters (whitespace removed: $(( ${#SRC_TOKEN} - ${#tok} ))), kind: $(case "$tok" in github_pat_*) echo fine-grained;; ghp_*) echo classic;; gho_*) echo oauth;; *) echo unknown;; esac)"
+          echo "source repo secret: ${#SRC_REPO} characters"
+          code() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H "Accept: application/vnd.github+json" "https://api.github.com/$1"; }
+          echo "GET /user: $(code user)"
+          echo "GET /repos/<source>: $(code "repos/$SRC_REPO")"
+          echo "GET /repos/<source>/releases/tags/game-v1: $(code "repos/$SRC_REPO/releases/tags/game-v1")"
+          perms=$(curl -s -H "Authorization: Bearer $tok" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$SRC_REPO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('permissions'))" 2>/dev/null)
+          echo "permissions on <source>: $perms"
+          echo "token scopes header: $(curl -s -D - -o /dev/null -H "Authorization: Bearer $tok" https://api.github.com/user | grep -i '^x-oauth-scopes\|^github-authentication-token-expiration' | tr -d '\r')"
